@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use bevy::ecs::system::NonSendMarker;
 use bevy::prelude::*;
 use bevy::window::{PrimaryWindow, RawHandleWrapper};
-use objc2::runtime::{AnyObject, NSObject};
+use objc2::runtime::{AnyClass, AnyObject, AnyProtocol, NSObject};
 use objc2::{define_class, msg_send, ClassType};
 use raw_window_handle::RawWindowHandle;
 
@@ -31,12 +31,28 @@ define_class!(
             SCENE.store(scene as *const AnyObject as usize, Ordering::Release);
             attach();
         }
+
+        /// `UIWindowSceneDelegate.window`: the window winit created, once attached.
+        #[unsafe(method(window))]
+        fn window(&self) -> *mut AnyObject {
+            if ATTACHED.load(Ordering::Acquire) {
+                WINDOW.load(Ordering::Acquire) as *mut AnyObject
+            } else {
+                std::ptr::null_mut()
+            }
+        }
     }
 );
 
-/// Register the delegate class before `UIApplicationMain`, which looks it up by name.
+/// Register the delegate class before `UIApplicationMain`, which looks it up by name. UIKit also
+/// asserts that the class conforms to the scene delegate protocols, so declare them on the class.
 pub fn register() {
-    let _ = SceneDelegate::class();
+    let class = SceneDelegate::class() as *const AnyClass as *mut AnyClass;
+    for name in [c"UISceneDelegate", c"UIWindowSceneDelegate"] {
+        if let Some(protocol) = AnyProtocol::get(name) {
+            unsafe { objc2::ffi::class_addProtocol(class, protocol) };
+        }
+    }
 }
 
 fn attach() {
