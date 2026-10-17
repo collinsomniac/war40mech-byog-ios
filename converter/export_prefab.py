@@ -13,8 +13,12 @@ import struct
 import sys
 
 import UnityPy
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # sibling modules under python -I
 from PIL import Image, ImageStat
 from UnityPy.helpers.MeshHelper import MeshHandler
+
+import anim
 
 FLOAT, UINT32 = 5126, 5125
 ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER = 34962, 34963
@@ -30,21 +34,28 @@ class Gltf:
         self.material_index: dict[int, int] = {}
         self.image_index: dict[str, int] = {}
 
-    def _view(self, data: bytes, target: int) -> int:
+    def _view(self, data: bytes, target: int | None) -> int:
         while len(self.blob) % 4:
             self.blob.append(0)
-        self.doc["bufferViews"].append({"buffer": 0, "byteOffset": len(self.blob), "byteLength": len(data),
-                                        "target": target})
+        view = {"buffer": 0, "byteOffset": len(self.blob), "byteLength": len(data)}
+        if target is not None:
+            view["target"] = target
+        self.doc["bufferViews"].append(view)
         self.blob += data
         return len(self.doc["bufferViews"]) - 1
 
-    def accessor(self, rows: list, kind: str, minmax: bool = False) -> int:
+    def accessor(self, rows: list, kind: str, minmax: bool = False, indices: bool = False,
+                 animation: bool = False) -> int:
+        """Vertex data by default; `indices` for triangle lists; `animation` for sampler input/output."""
         width = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}[kind]
         flat = [c for row in rows for c in (row if width > 1 else (row,))]
-        if kind == "SCALAR":
+        if indices:
             data, ctype, target = struct.pack(f"<{len(flat)}I", *flat), UINT32, ELEMENT_ARRAY_BUFFER
         else:
-            data, ctype, target = struct.pack(f"<{len(flat)}f", *flat), FLOAT, ARRAY_BUFFER
+            data, ctype = struct.pack(f"<{len(flat)}f", *flat), FLOAT
+            target = None if animation else ARRAY_BUFFER
+        if width == 1:
+            rows = [(r,) for r in rows]
         acc = {"bufferView": self._view(data, target), "componentType": ctype, "count": len(rows), "type": kind}
         if minmax:
             acc["min"] = [min(r[i] for r in rows) for i in range(width)]
@@ -169,7 +180,7 @@ class Exporter:
             if not triangles:
                 continue
             indices = [index for a, b, c in triangles for index in (a, c, b)]
-            prim = {"attributes": attributes, "indices": gltf.accessor(indices, "SCALAR")}
+            prim = {"attributes": attributes, "indices": gltf.accessor(indices, "SCALAR", indices=True)}
             if i < len(materials):
                 prim["material"] = self.material(gltf, materials[i])
             primitives.append(prim)
@@ -196,15 +207,55 @@ class Exporter:
             stats["skipped_skinned"] += 1
         gltf.doc["nodes"].append(node)
         index = len(gltf.doc["nodes"]) - 1
+        if "Animator" in components:
+            self.animators.append((index, components["Animator"].read()))
         children = [self.node(gltf, child.read(), stats) for child in transform.m_Children]
         if children:
             gltf.doc["nodes"][index]["children"] = children
         return index
 
+    def animations(self, gltf: Gltf, stats: dict) -> None:
+        """Every clip of every Animator's controller becomes a glTF animation targeting the exported nodes."""
+        for animator_node, animator in self.animators:
+            if not animator.m_Avatar.path_id or not animator.m_Controller.path_id:
+                continue
+            path_of_hash = {h: p for h, p in animator.m_Avatar.read().m_TOS}
+            node_of_path = {}
+
+            def walk(node_index: int, path: str) -> None:
+                node_of_path[path] = node_index
+                for child in gltf.doc["nodes"][node_index].get("children", []):
+                    name = gltf.doc["nodes"][child]["name"]
+                    walk(child, f"{path}/{name}" if path else name)
+
+            walk(animator_node, "")
+            seen = set()
+            for clip_ptr in animator.m_Controller.read().m_AnimationClips:
+                if clip_ptr.path_id in seen:
+                    continue
+                seen.add(clip_ptr.path_id)
+                clip = clip_ptr.read()
+                channels, samplers = [], []
+                for path, prop, times, values in anim.sample_clip(clip, path_of_hash):
+                    if path not in node_of_path:
+                        continue
+                    samplers.append({"input": gltf.accessor(times, "SCALAR", minmax=True, animation=True),
+                                     "output": gltf.accessor(values, "VEC4" if prop == "rotation" else "VEC3",
+                                                             animation=True),
+                                     "interpolation": "LINEAR"})
+                    channels.append({"sampler": len(samplers) - 1,
+                                     "target": {"node": node_of_path[path], "path": prop}})
+                if channels:
+                    gltf.doc.setdefault("animations", []).append(
+                        {"name": clip.m_Name, "channels": channels, "samplers": samplers})
+                    stats["clips"] += 1
+
     def export(self, root_transform, name: str) -> dict:
         gltf = Gltf()
-        stats = {"meshes": 0, "skipped_skinned": 0}
+        stats = {"meshes": 0, "skipped_skinned": 0, "clips": 0}
+        self.animators = []
         gltf.doc["scenes"][0]["nodes"].append(self.node(gltf, root_transform, stats))
+        self.animations(gltf, stats)
         out = self.models_dir / f"{name}.glb"
         gltf.write(out)
         stats["bytes"] = out.stat().st_size

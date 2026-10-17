@@ -28,7 +28,7 @@ def trs(node):
             [0, 0, 0, 1]]
 
 
-def load(path):
+def load(path, animation=None, at=0.0):
     data = pathlib.Path(path).read_bytes()
     json_len = struct.unpack_from("<I", data, 12)[0]
     doc = json.loads(data[20:20 + json_len])
@@ -42,10 +42,25 @@ def load(path):
         flat = struct.unpack_from(f"<{acc['count'] * width}{fmt}", blob, view["byteOffset"])
         return [flat[i:i + width] for i in range(0, len(flat), width)] if width > 1 else list(flat)
 
+    overrides = {}
+    for clip in doc.get("animations", []):
+        if clip["name"] != animation:
+            continue
+        for channel in clip["channels"]:
+            sampler = clip["samplers"][channel["sampler"]]
+            times, values = read(sampler["input"]), read(sampler["output"])
+            i = max(0, min(len(times) - 2, next((k for k, t in enumerate(times) if t > at), len(times) - 1) - 1))
+            f = 0.0 if times[i + 1] == times[i] else max(0.0, min(1.0, (at - times[i]) / (times[i + 1] - times[i])))
+            value = [a + (b - a) * f for a, b in zip(values[i], values[i + 1])]
+            if channel["target"]["path"] == "rotation":
+                n = math.sqrt(sum(c * c for c in value)) or 1
+                value = [c / n for c in value]
+            overrides.setdefault(channel["target"]["node"], {})[channel["target"]["path"]] = value
+
     triangles = []
 
     def walk(index, parent):
-        node = doc["nodes"][index]
+        node = {**doc["nodes"][index], **overrides.get(index, {})}
         world = mat_mul(parent, trs(node))
         if "mesh" in node and not node.get("extras", {}).get("inactive"):
             for prim in doc["meshes"][node["mesh"]]["primitives"]:
@@ -91,9 +106,17 @@ def render(triangles, axis, size=512):
 
 
 if __name__ == "__main__":
-    tris = load(sys.argv[1])
-    sheet = Image.new("RGB", (1024, 512))
-    sheet.paste(render(tris, "front"), (0, 0))
-    sheet.paste(render(tris, "side"), (512, 0))
-    sheet.save(sys.argv[2])
-    print(f"{len(tris)} triangles -> {sys.argv[2]}")
+    # preview_glb.py model.glb out.png [animation t1 t2 ...]  -> side views of the pose at each time
+    model, out = sys.argv[1], sys.argv[2]
+    if len(sys.argv) > 3:
+        animation, stamps = sys.argv[3], [float(t) for t in sys.argv[4:]]
+        sheet = Image.new("RGB", (256 * len(stamps), 256))
+        for k, t in enumerate(stamps):
+            sheet.paste(render(load(model, animation, t), "side", 256), (256 * k, 0))
+    else:
+        tris = load(model)
+        sheet = Image.new("RGB", (1024, 512))
+        sheet.paste(render(tris, "front"), (0, 0))
+        sheet.paste(render(tris, "side"), (512, 0))
+    sheet.save(out)
+    print(f"-> {out}")

@@ -11,6 +11,8 @@ import sys
 import time
 
 import UnityPy
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # sibling modules under python -I
 from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 
 import odin
