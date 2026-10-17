@@ -5,7 +5,9 @@
 
 mod pack;
 
+use bevy::asset::io::AssetSourceBuilder;
 use bevy::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Base URL of the pack server. Override at build time with the COGITATOR_SERVER environment variable.
@@ -14,29 +16,50 @@ const SERVER: &str = match option_env!("COGITATOR_SERVER") {
     None => "http://desktop-3rsf4r5:8790",
 };
 
+/// First model shown once the pack is in place: proof that converted geometry and textures render.
+const SHOWCASE_MODEL: &str = "models/Warrior.glb";
+
 #[derive(Resource, Clone, Default)]
-struct Status(Arc<Mutex<String>>);
+struct Status {
+    text: Arc<Mutex<String>>,
+    ready: Arc<AtomicBool>,
+}
 
 impl Status {
     fn set(&self, text: String) {
-        *self.0.lock().unwrap() = text;
+        *self.text.lock().unwrap() = text;
     }
 }
 
 #[derive(Component)]
 struct StatusText;
 
+#[derive(Component)]
+struct Showcase;
+
 fn main() {
+    let pack_dir = pack::pack_dir();
     App::new()
+        .register_asset_source(
+            "pack",
+            AssetSourceBuilder::platform_default(pack_dir.to_str().expect("pack path is UTF-8"), None),
+        )
         .add_plugins(DefaultPlugins)
         .insert_resource(Status::default())
         .add_systems(Startup, (setup, start_sync))
-        .add_systems(Update, show_status)
+        .add_systems(Update, (show_status, spawn_showcase, turn_showcase))
         .run();
 }
 
 fn setup(mut commands: Commands) {
-    commands.spawn(Camera2d);
+    commands.spawn((Camera3d::default(), Transform::from_xyz(0.0, 1.3, 4.5).looking_at(Vec3::new(0.0, 1.0, 0.0), Vec3::Y)));
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 8_000.0,
+            ..default()
+        },
+        Transform::from_xyz(2.0, 4.0, 3.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
     commands.spawn((
         Text::new("Cogitator"),
         Node {
@@ -52,10 +75,13 @@ fn start_sync(status: Res<Status>) {
     std::thread::spawn(move || {
         let dir = pack::pack_dir();
         let result = pack::sync(SERVER, &dir, &|line| status.set(line));
-        status.set(match result {
-            Ok(manifest) => summarize(&manifest, &dir),
-            Err(error) => format!("Pack sync failed:\n{error}\n\nIs the pack server running on your PC?"),
-        });
+        match result {
+            Ok(manifest) => {
+                status.set(summarize(&manifest, &dir));
+                status.ready.store(true, Ordering::Release);
+            }
+            Err(error) => status.set(format!("Pack sync failed:\n{error}\n\nIs the pack server running on your PC?")),
+        }
     });
 }
 
@@ -73,10 +99,32 @@ fn summarize(manifest: &pack::Manifest, dir: &std::path::Path) -> String {
 }
 
 fn show_status(status: Res<Status>, mut texts: Query<&mut Text, With<StatusText>>) {
-    let current = status.0.lock().unwrap().clone();
+    let current = status.text.lock().unwrap().clone();
     for mut text in &mut texts {
         if text.0 != current {
             text.0 = current.clone();
         }
+    }
+}
+
+fn spawn_showcase(
+    mut commands: Commands,
+    status: Res<Status>,
+    assets: Res<AssetServer>,
+    existing: Query<(), With<Showcase>>,
+) {
+    if !existing.is_empty() || !status.ready.load(Ordering::Acquire) {
+        return;
+    }
+    if !pack::pack_dir().join(SHOWCASE_MODEL).exists() {
+        return;
+    }
+    let scene = assets.load(GltfAssetLabel::Scene(0).from_asset(format!("pack://{SHOWCASE_MODEL}")));
+    commands.spawn((WorldAssetRoot(scene), Transform::default(), Showcase));
+}
+
+fn turn_showcase(time: Res<Time>, mut models: Query<&mut Transform, With<Showcase>>) {
+    for mut transform in &mut models {
+        transform.rotate_y(0.4 * time.delta_secs());
     }
 }
