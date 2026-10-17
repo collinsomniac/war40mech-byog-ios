@@ -46,8 +46,8 @@ fn get(url: &str) -> Result<Vec<u8>, String> {
 /// Bring `dir` in line with the server's manifest. `report` receives human-readable progress lines.
 pub fn sync(server: &str, dir: &Path, report: &dyn Fn(String)) -> Result<Manifest, String> {
     report(format!("Contacting {server} ..."));
-    let manifest: Manifest = serde_json::from_slice(&get(&format!("{server}/manifest.json"))?)
-        .map_err(|e| format!("manifest: {e}"))?;
+    let manifest_bytes = get(&format!("{server}/manifest.json"))?;
+    let manifest: Manifest = serde_json::from_slice(&manifest_bytes).map_err(|e| format!("manifest: {e}"))?;
 
     let stale: Vec<&ManifestFile> = manifest.files.iter().filter(|f| !up_to_date(&dir.join(&f.path), f)).collect();
     let total: u64 = stale.iter().map(|f| f.size).sum();
@@ -72,5 +72,8 @@ pub fn sync(server: &str, dir: &Path, report: &dyn Fn(String)) -> Result<Manifes
         fs::rename(&partial, &local).map_err(|e| e.to_string())?;
         done += file.size;
     }
+    // Kept locally so a later launch without the PC can still play from this pack.
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    fs::write(dir.join("manifest.json"), &manifest_bytes).map_err(|e| e.to_string())?;
     Ok(manifest)
 }

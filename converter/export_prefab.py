@@ -7,6 +7,7 @@ Unity is left-handed (Y up), glTF right-handed (Y up): X is mirrored, which also
 quaternion Y/Z and tangent handedness. Unity UV origin is bottom-left, glTF top-left.
 """
 import argparse
+import math
 import json
 import pathlib
 import struct
@@ -205,14 +206,72 @@ class Exporter:
                     stats["meshes"] += 1
         if "SkinnedMeshRenderer" in components:
             stats["skipped_skinned"] += 1
+        if "Camera" in components:
+            cam = components["Camera"].read_typetree()
+            if cam.get("m_Enabled"):
+                node.setdefault("extras", {})["camera"] = {
+                    "fov": cam.get("field of view", 60.0), "near": cam.get("near clip plane", 0.3),
+                    "far": cam.get("far clip plane", 1000.0), "ortho": bool(cam.get("orthographic", 0)),
+                    "depth": cam.get("m_Depth", 0)}
+                stats["cameras"] = stats.get("cameras", 0) + 1
+        light_child = None
+        if "Light" in components:
+            light = components["Light"].read()
+            if light.m_Enabled and go.m_IsActive:
+                light_child = self.light(gltf, light)
+                stats["lights"] = stats.get("lights", 0) + 1
         gltf.doc["nodes"].append(node)
         index = len(gltf.doc["nodes"]) - 1
         if "Animator" in components:
             self.animators.append((index, components["Animator"].read()))
         children = [self.node(gltf, child.read(), stats) for child in transform.m_Children]
+        if light_child is not None:
+            children.append(light_child)
         if children:
             gltf.doc["nodes"][index]["children"] = children
         return index
+
+    def light(self, gltf: Gltf, light) -> int:
+        """A KHR_lights_punctual light on a child node turned 180 degrees: Unity lights shine along +Z,
+        glTF lights along -Z. Unity intensities have no physical unit; the scale is tuned by eye."""
+        kind = {0: "spot", 1: "directional", 2: "point"}.get(light.m_Type, "point")
+        c = light.m_Color
+        entry = {"type": kind, "color": [c.r, c.g, c.b], "intensity": light.m_Intensity * (3.0 if kind == "directional" else 60.0)}
+        if kind != "directional":
+            entry["range"] = light.m_Range
+        if kind == "spot":
+            half = math.radians(light.m_SpotAngle) / 2
+            entry["spot"] = {"innerConeAngle": half * 0.8, "outerConeAngle": half}
+        ext = gltf.doc.setdefault("extensions", {}).setdefault("KHR_lights_punctual", {"lights": []})
+        ext["lights"].append(entry)
+        used = gltf.doc.setdefault("extensionsUsed", [])
+        if "KHR_lights_punctual" not in used:
+            used.append("KHR_lights_punctual")
+        gltf.doc["nodes"].append({"name": "light", "rotation": [0.0, 1.0, 0.0, 0.0],
+                                  "extensions": {"KHR_lights_punctual": {"light": len(ext["lights"]) - 1}}})
+        return len(gltf.doc["nodes"]) - 1
+
+    def export_scene(self, env, name: str) -> dict:
+        """Every non-UI root of a scene file into one glTF (UI is exported separately by export_ui)."""
+        gltf = Gltf()
+        stats = {"meshes": 0, "skipped_skinned": 0, "clips": 0, "roots": 0}
+        self.animators = []
+        for obj in env.objects:
+            if obj.type.name != "Transform":
+                continue
+            transform = obj.read()
+            if transform.m_Father.path_id:
+                continue
+            try:
+                gltf.doc["scenes"][0]["nodes"].append(self.node(gltf, transform, stats))
+                stats["roots"] += 1
+            except Exception as e:
+                stats.setdefault("errors", []).append(f"{transform.m_GameObject.read().m_Name}: {type(e).__name__}: {e}")
+        self.animations(gltf, stats)
+        out = self.models_dir / f"{name}.glb"
+        gltf.write(out)
+        stats["bytes"] = out.stat().st_size
+        return stats
 
     def animations(self, gltf: Gltf, stats: dict) -> None:
         """Every clip of every Animator's controller becomes a glTF animation targeting the exported nodes."""
@@ -280,10 +339,16 @@ def main() -> int:
     ap.add_argument("data_dir", type=pathlib.Path)
     ap.add_argument("--pack", type=pathlib.Path, required=True)
     ap.add_argument("--file", default="resources.assets")
-    ap.add_argument("names", nargs="+", help="root GameObject names to export")
+    ap.add_argument("names", nargs="*", help="root GameObject names to export")
+    ap.add_argument("--scene", action="append", default=[], help="levelN=Name: export a whole scene")
     args = ap.parse_args()
 
     exporter = Exporter(args.pack)
+    for spec in args.scene:
+        level, name = spec.split("=")
+        print(name, exporter.export_scene(UnityPy.load(str(args.data_dir / level)), name))
+    if not args.names:
+        return 0
     env = UnityPy.load(str(args.data_dir / args.file))
     found = set()
     for name, transform in find_roots(env, set(args.names)):
