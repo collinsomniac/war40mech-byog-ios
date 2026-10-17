@@ -234,13 +234,22 @@ pub fn spawn(commands: &mut Commands, doc: &UiDoc, assets: &AssetServer, fonts: 
         ))
         .id();
     for canvas in &doc.canvases {
-        let child = spawn_node(commands, canvas, assets, fonts, loc, 0);
+        let child = spawn_node(commands, canvas, assets, fonts, loc, 0, 1.0);
         commands.entity(root).add_child(child);
     }
     root
 }
 
-fn spawn_node(commands: &mut Commands, node: &UiNode, assets: &AssetServer, fonts: &Fonts, loc: &Loc, depth: u32) -> Entity {
+/// `group_alpha` is the product of the CanvasGroup alphas above this node (Unity multiplies them down).
+fn spawn_node(
+    commands: &mut Commands,
+    node: &UiNode,
+    assets: &AssetServer,
+    fonts: &Fonts,
+    loc: &Loc,
+    depth: u32,
+    group_alpha: f32,
+) -> Entity {
     let mut entity = commands.spawn((
         Node { position_type: PositionType::Absolute, ..default() },
         UnityNode { name: node.name.clone(), scripts: node.scripts.clone() },
@@ -260,11 +269,12 @@ fn spawn_node(commands: &mut Commands, node: &UiNode, assets: &AssetServer, font
         entity.insert(GlobalZIndex(canvas.sort * 10 + depth as i32));
     }
     let interactive = !node.events.is_empty() || node.image.as_ref().is_some_and(|i| i.raycast && i.color[3] > 0.0);
-    entity.insert(if interactive { Pickable::default() } else { Pickable::IGNORE });
     if !node.events.is_empty() {
         entity.insert(UnityEvents(node.events.clone()));
     }
-    let alpha = node.alpha.unwrap_or(1.0);
+    let alpha = group_alpha * node.alpha.unwrap_or(1.0);
+    // A fully transparent group is how Unity hides panels until a script fades them in.
+    let (interactive, hidden_group) = (interactive && alpha > 0.0, alpha <= 0.0);
     if let Some(image) = &node.image {
         let tint = color([image.color[0], image.color[1], image.color[2], image.color[3] * alpha]);
         match image.sprite.as_ref().and_then(|s| s.file.as_ref().map(|f| (s, f))) {
@@ -290,6 +300,11 @@ fn spawn_node(commands: &mut Commands, node: &UiNode, assets: &AssetServer, font
             }
             None => {}
         }
+    }
+    entity.insert(if interactive { Pickable::default() } else { Pickable::IGNORE });
+    // UIPanel (the game's popup base class) starts closed until game logic opens it.
+    if hidden_group || node.scripts.iter().any(|s| s == "UIPanel") {
+        entity.insert(UnityActive(false));
     }
     let id = entity.id();
     if let Some(text) = &node.text {
@@ -319,7 +334,7 @@ fn spawn_node(commands: &mut Commands, node: &UiNode, assets: &AssetServer, font
         commands.entity(id).add_child(label);
     }
     for child in &node.children {
-        let child = spawn_node(commands, child, assets, fonts, loc, depth + 1);
+        let child = spawn_node(commands, child, assets, fonts, loc, depth + 1, alpha);
         commands.entity(id).add_child(child);
     }
     id

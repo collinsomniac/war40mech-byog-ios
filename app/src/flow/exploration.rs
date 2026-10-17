@@ -17,10 +17,13 @@ pub fn bind(target: &str, method: &str, _arg: &str) -> Option<Action> {
 
 /// DungeonUI holds both the exploration and battle HUDs; exploration shows its own and the shared one.
 pub fn prepare(mut nodes: Query<(&UnityNode, &mut UnityActive)>, mut parity: ResMut<Parity>) {
+    // Popups the exploration scripts open on demand.
+    const CLOSED: &[&str] = &["UICanticles", "UIExploEvent", "UIExploEventEnd", "UIErrorMessage", "UIErrorMessageMiddle", "UIExploMissionStart"];
     for (node, mut active) in &mut nodes {
         match node.name.as_str() {
             "Explo" | "Common" => active.0 = true,
             "Battle" | "ControllerHelper" | "SaveInProgressWindow" | "UITurn" => active.0 = false,
+            _ if CLOSED.iter().any(|c| node.has_script(c)) => active.0 = false,
             _ => {}
         }
     }

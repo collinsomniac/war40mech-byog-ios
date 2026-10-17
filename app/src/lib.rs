@@ -225,7 +225,14 @@ fn finish_boot(
         }
     }
     commands.insert_resource(unity_ui::Fonts::load(&pack.0, &assets));
-    next.set(GameState::MainMenu);
+    // Development: COGITATOR_START=Exploration (etc.) opens that state directly.
+    let start = match std::env::var("COGITATOR_START").as_deref() {
+        Ok("Exploration") => GameState::Exploration,
+        Ok("Battle") => GameState::Battle,
+        Ok("Ark") => GameState::Ark,
+        _ => GameState::MainMenu,
+    };
+    next.set(start);
 }
 
 fn hide_status(mut texts: Query<&mut Visibility, With<StatusText>>) {
