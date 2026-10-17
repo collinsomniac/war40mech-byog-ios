@@ -16,8 +16,9 @@ const SERVER: &str = match option_env!("COGITATOR_SERVER") {
     None => "http://desktop-3rsf4r5:8790",
 };
 
-/// First model shown once the pack is in place: proof that converted geometry and textures render.
+/// First model shown once the pack is in place: proof that converted geometry, textures and animation work.
 const SHOWCASE_MODEL: &str = "models/Warrior.glb";
+const SHOWCASE_CLIP: &str = "Idle_01";
 
 #[derive(Resource, Clone, Default)]
 struct Status {
@@ -37,6 +38,10 @@ struct StatusText;
 #[derive(Component)]
 struct Showcase;
 
+/// The showcase model's glTF, kept so its named animation clips can be looked up once loaded.
+#[derive(Resource)]
+struct ShowcaseGltf(Handle<Gltf>);
+
 fn main() {
     let pack_dir = pack::pack_dir();
     App::new()
@@ -47,7 +52,7 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .insert_resource(Status::default())
         .add_systems(Startup, (setup, start_sync))
-        .add_systems(Update, (show_status, spawn_showcase, turn_showcase))
+        .add_systems(Update, (show_status, spawn_showcase, turn_showcase, animate_showcase))
         .run();
 }
 
@@ -120,7 +125,29 @@ fn spawn_showcase(
         return;
     }
     let scene = assets.load(GltfAssetLabel::Scene(0).from_asset(format!("pack://{SHOWCASE_MODEL}")));
+    commands.insert_resource(ShowcaseGltf(assets.load(format!("pack://{SHOWCASE_MODEL}"))));
     commands.spawn((WorldAssetRoot(scene), Transform::default(), Showcase));
+}
+
+/// The glTF loader puts an AnimationPlayer on the animated root; start the showcase clip on it, looping.
+fn animate_showcase(
+    mut commands: Commands,
+    showcase: Option<Res<ShowcaseGltf>>,
+    gltfs: Res<Assets<Gltf>>,
+    mut graphs: ResMut<Assets<AnimationGraph>>,
+    mut players: Query<(Entity, &mut AnimationPlayer), Without<AnimationGraphHandle>>,
+) {
+    let Some(clip) = showcase
+        .and_then(|s| gltfs.get(&s.0))
+        .and_then(|gltf| gltf.named_animations.get(SHOWCASE_CLIP).cloned())
+    else {
+        return;
+    };
+    for (entity, mut player) in &mut players {
+        let (graph, node) = AnimationGraph::from_clip(clip.clone());
+        commands.entity(entity).insert(AnimationGraphHandle(graphs.add(graph)));
+        player.play(node).repeat();
+    }
 }
 
 fn turn_showcase(time: Res<Time>, mut models: Query<&mut Transform, With<Showcase>>) {
