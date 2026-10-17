@@ -2,7 +2,9 @@
 //! ported logic. Every Unity persistent call is bound by `Class.Method` to an `Action`; a call with no
 //! binding is reported in-game as not yet ported and counted in `Parity`.
 
+pub mod exploration;
 pub mod main_menu;
+pub mod scene3d;
 
 use bevy::prelude::*;
 use std::collections::BTreeMap;
@@ -27,6 +29,7 @@ impl GameState {
     pub fn ui_scenes(self) -> &'static [&'static str] {
         match self {
             GameState::MainMenu => &["MainMenu"],
+            GameState::Exploration => &["DungeonUI"],
             _ => &[],
         }
     }
@@ -49,6 +52,7 @@ pub enum Action {
 /// Bind a Unity call to an action.
 pub fn bind(target: &str, method: &str, arg: &str) -> Action {
     main_menu::bind(target, method, arg)
+        .or_else(|| exploration::bind(target, method, arg))
         .or_else(|| windows::bind(target, method))
         .unwrap_or_else(|| Action::Unported(format!("{target}.{method}")))
 }
@@ -64,8 +68,9 @@ mod windows {
     }
 
     pub const WINDOWS: &[&str] = &[
-        "UIWindowNewGame", "UIWindowSettings", "UIWindowSettingsConsole", "UIWindowLoadGame",
-        "UIWindowWarning", "UIWindowInfo", "UIWindowCredits",
+        "UIWindowNewGame", "UIWindowNewGameExtraSettings", "UIWindowSettings", "UIWindowSettingsConsole",
+        "UIWindowLoadGame", "UIWindowWarning", "UIWindowInfo", "UIWindowCredits", "UIWindowMenuPauseDungeon",
+        "UIWindowDifficultySettings", "UIWindowSaveGame",
     ];
 }
 
@@ -74,6 +79,15 @@ mod windows {
 pub struct Parity {
     pub unported: BTreeMap<String, u32>,
     pub last: Option<String>,
+}
+
+impl Parity {
+    /// Record something the player reached that isn't ported yet.
+    pub fn report(&mut self, name: &str) {
+        warn!("not yet ported: {name}");
+        *self.unported.entry(name.to_string()).or_default() += 1;
+        self.last = Some(name.to_string());
+    }
 }
 
 #[derive(Component)]
@@ -86,10 +100,15 @@ impl Plugin for FlowPlugin {
         app.init_state::<GameState>()
             .init_resource::<Parity>()
             .add_systems(Startup, spawn_toast)
-            .add_systems(OnEnter(GameState::MainMenu), ((spawn_scene_ui, main_menu::prepare).chain(), main_menu::spawn_backdrop))
-            .add_systems(OnExit(GameState::MainMenu), (despawn_scene_ui, main_menu::despawn_backdrop))
-            .add_systems(OnEnter(GameState::Intro), unported_state)
-            .add_systems(Update, (run_calls, show_toast, main_menu::frame_backdrop, main_menu::scale_lights));
+            .add_systems(OnEnter(GameState::MainMenu), ((spawn_scene_ui, main_menu::prepare).chain(), scene3d::spawn))
+            .add_systems(OnEnter(GameState::Intro), exploration::skip_intro)
+            .add_systems(OnEnter(GameState::Exploration), ((spawn_scene_ui, exploration::prepare).chain(), scene3d::spawn))
+            .add_systems(OnEnter(GameState::Battle), unported_state)
+            .add_systems(OnEnter(GameState::Ark), unported_state)
+            .add_systems(Update, (run_calls, show_toast, scene3d::frame, scene3d::scale_lights));
+        for state in [GameState::MainMenu, GameState::Exploration] {
+            app.add_systems(OnExit(state), (despawn_scene_ui, scene3d::despawn));
+        }
     }
 }
 
@@ -119,9 +138,7 @@ fn despawn_scene_ui(mut commands: Commands, roots: Query<Entity, With<UnityUiRoo
 
 /// A state whose scene isn't ported yet still loads, says so, and offers the way back.
 fn unported_state(state: Res<State<GameState>>, mut parity: ResMut<Parity>) {
-    let name = format!("Scene {:?}", state.get());
-    *parity.unported.entry(name.clone()).or_default() += 1;
-    parity.last = Some(name);
+    parity.report(&format!("Scene {:?}", state.get()));
 }
 
 fn run_calls(
@@ -141,11 +158,7 @@ fn run_calls(
                 exit.write(AppExit::Success);
             }
             Action::Rollover | Action::Ignore => {}
-            Action::Unported(name) => {
-                warn!("not yet ported: {name}");
-                *parity.unported.entry(name.clone()).or_default() += 1;
-                parity.last = Some(name);
-            }
+            Action::Unported(name) => parity.report(&name),
         }
     }
 }

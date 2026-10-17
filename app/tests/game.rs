@@ -121,4 +121,19 @@ fn boots_to_main_menu_and_opens_new_game() {
     app.update();
     let window = find(&mut app, "NewGameWindow").expect("New Game window exists");
     assert!(app.world().get::<UnityActive>(window).unwrap().0, "New Game window opened");
+
+    // Start: the intro is skipped (reported unported) and the tomb's exploration screen comes up.
+    let start = find(&mut app, "BtnNewGame").expect("window's New game button");
+    app.world_mut().write_message(UnityCall {
+        source: start,
+        event: UEvent { on: "UiButton".into(), target: "UIWindowNewGame".into(), method: "BtnNewGame".into(), arg: String::new() },
+    });
+    for _ in 0..6 {
+        app.update();
+    }
+    assert_eq!(*app.world().resource::<State<GameState>>().get(), GameState::Exploration);
+    let hud = find(&mut app, "Explo").expect("exploration HUD spawned");
+    assert!(app.world().get::<UnityActive>(hud).unwrap().0, "exploration HUD shown");
+    let parity = app.world().resource::<flow::Parity>();
+    eprintln!("parity so far: {:?}", parity.unported.keys().collect::<Vec<_>>());
 }
