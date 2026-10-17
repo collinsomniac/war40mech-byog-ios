@@ -8,6 +8,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use bevy::ecs::system::NonSendMarker;
 use bevy::prelude::*;
 use bevy::window::{PrimaryWindow, RawHandleWrapper};
 use objc2::runtime::{AnyObject, NSObject};
