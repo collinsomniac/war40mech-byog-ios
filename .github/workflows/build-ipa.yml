@@ -1,0 +1,60 @@
+name: build-ipa
+
+# Unsigned sideload build of the Cogitator app. The IPA contains only this repo's code: no game content.
+# Sign and install it with the pipeline from collinsomniac/agent-ios-ipas (Sideloadly or loopdeploy resign,
+# then tools/install_signed.py over Tailscale). The signer must keep increased-memory-limit.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['app/**', '.github/workflows/build-ipa.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: '17.0'
+      COGITATOR_SERVER: ${{ vars.COGITATOR_SERVER }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-apple-ios
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+
+      - name: Build
+        working-directory: app
+        run: cargo build --release --target aarch64-apple-ios
+
+      - name: Package IPA
+        run: |
+          set -e
+          BUILD=${{ github.run_number }}
+          APP=Payload/Cogitator.app
+          mkdir -p "$APP"
+          cp app/target/aarch64-apple-ios/release/cogitator "$APP/cogitator"
+          sed "s/BUILD_NUMBER/$BUILD/" app/ios/Info.plist > "$APP/Info.plist"
+          plutil -lint "$APP/Info.plist"
+          # ad-hoc sign WITH entitlements so the sideload signer knows to request the memory limit
+          codesign -f -s - --entitlements app/ios/cogitator.entitlements "$APP"
+          zip -qry "Cogitator-$BUILD.ipa" Payload
+          ls -la *.ipa
+          echo "IPA=Cogitator-$BUILD.ipa" >> "$GITHUB_ENV"
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" "$IPA" \
+            --title "build-${{ github.run_number }}" \
+            --notes "Unsigned sideload build from ${{ github.sha }}. Contains no game content."

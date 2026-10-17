@@ -1,0 +1,12 @@
+# Anything converted from a game installation stays on the player's machine.
+/content/
+*.assets
+*.resS
+*.resource
+*.bank
+*.ipa
+
+# Tooling
+.venv/
+__pycache__/
+target/
