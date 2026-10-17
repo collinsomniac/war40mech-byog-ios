@@ -3,6 +3,8 @@
 //! This app ships no game content. On launch it syncs a content pack converted from the player's own
 //! installation and served from their PC over Tailscale.
 
+#[cfg(target_os = "ios")]
+mod ios_scene;
 mod pack;
 
 use bevy::asset::io::AssetSourceBuilder;
@@ -44,7 +46,13 @@ struct ShowcaseGltf(Handle<Gltf>);
 
 fn main() {
     let pack_dir = pack::pack_dir();
-    App::new()
+    let mut app = App::new();
+    #[cfg(target_os = "ios")]
+    {
+        ios_scene::register();
+        app.add_systems(Update, ios_scene::attach_primary_window);
+    }
+    app
         .register_asset_source(
             "pack",
             AssetSourceBuilder::platform_default(pack_dir.to_str().expect("pack path is UTF-8"), None),

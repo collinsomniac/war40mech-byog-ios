@@ -2198,6 +2198,8 @@ name = "cogitator"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "objc2 0.6.5",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "sha2",
