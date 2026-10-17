@@ -12,10 +12,11 @@ use bevy::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Base URL of the pack server. Override at build time with the COGITATOR_SERVER environment variable.
+/// Base URL of the pack server. Override at build time with the COGITATOR_SERVER environment variable
+/// (CI passes an empty string when the repository variable is unset, so empty means default).
 const SERVER: &str = match option_env!("COGITATOR_SERVER") {
-    Some(url) => url,
-    None => "http://desktop-3rsf4r5:8790",
+    Some(url) if !url.is_empty() => url,
+    _ => "http://desktop-3rsf4r5:8790",
 };
 
 /// First model shown once the pack is in place: proof that converted geometry, textures and animation work.
