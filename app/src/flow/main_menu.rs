@@ -14,6 +14,7 @@ pub fn bind(target: &str, method: &str, _arg: &str) -> Option<Action> {
         ("MainMenuQuit", "OnClick") => Action::Quit,
         ("MainMenuRollover", "OnRollover") => Action::Rollover,
         ("UIWindowNewGame", "BtnNewGame") => Action::Goto(GameState::Intro),
+        ("MainMenu", "OnClickBtnContinue") => Action::Continue,
         ("UIWindowNewGame", "BtnClose") => Action::CloseWindow("UIWindowNewGame"),
         ("UIWindowNewGame", "BtnExtraSettings") => Action::OpenWindow("UIWindowNewGameExtraSettings"),
         ("UIWindowNewGameExtraSettings", "BtnValidate") => Action::CloseWindow("UIWindowNewGameExtraSettings"),
@@ -22,11 +23,17 @@ pub fn bind(target: &str, method: &str, _arg: &str) -> Option<Action> {
     })
 }
 
-/// What MainMenu.cs decides at startup: no save yet, so no Continue; base-game logo; no store banners;
+/// What MainMenu.cs decides at startup: Continue only with a save; base-game logo; no store banners;
 /// gamepad helpers hidden on touch.
-pub fn prepare(mut nodes: Query<(&UnityNode, &mut UnityActive)>) {
+pub fn prepare(mut nodes: Query<(&UnityNode, &mut UnityActive)>, pack: Res<crate::PackDir>) {
+    let has_save = super::campaign::Campaign::exists(&pack.0);
+    for (node, mut active) in &mut nodes {
+        if node.name == "BtnContinue" {
+            active.0 = has_save;
+        }
+    }
     const HIDE: &[&str] = &[
-        "BtnContinue", "LogoHeretek", "LogoHeretekPlus", "BuyDlcHeretek", "M2Artwork", "UIMainMenuBlocker",
+        "LogoHeretek", "LogoHeretekPlus", "BuyDlcHeretek", "M2Artwork", "UIMainMenuBlocker",
         "ControllerHelper", "BtnGamepad", "GamepadHighlight",
     ];
     for (node, mut active) in &mut nodes {

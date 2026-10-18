@@ -137,3 +137,149 @@ fn boots_to_main_menu_and_opens_new_game() {
     let parity = app.world().resource::<flow::Parity>();
     eprintln!("parity so far: {:?}", parity.unported.keys().collect::<Vec<_>>());
 }
+
+/// New Game → the intro deploys the tutorial team → the tutorial tomb, played through its events by
+/// always taking the first choice; fights are reported (the battle test covers them).
+#[test]
+fn new_game_reaches_and_plays_the_tutorial_tomb() {
+    use cogitator::rules::explore::{Expedition, Next};
+    use cogitator::rules::save::{Save, Settings};
+    let Some(dir) = pack() else { return };
+    let db = cogitator::data::Db::load(&dir).unwrap();
+    let mut save = Save::new_game(&db, Settings::default()).unwrap();
+    assert!(!save.techpriests.is_empty(), "new game has tech-priests");
+    save.deploy_tutorial(&db).unwrap();
+    let deployment = save.deployment.as_ref().unwrap();
+    assert_eq!(db.get(deployment.mission).unwrap().name(), "TUT1");
+    let mut ex = Expedition::begin(&db, &save).unwrap();
+    println!("tomb: {} rooms, {} corridors, start {}, seed {}", ex.tomb.rooms.len(), ex.tomb.links.len(), ex.tomb.start, ex.tomb.seed);
+    for (i, r) in ex.tomb.rooms.iter().enumerate() {
+        println!("  room {i} at {:?} depth {} event {:?}", r.pos, r.depth, r.event.and_then(|e| db.get(e)).map(|e| e.name()));
+    }
+    let mut fights = 0;
+    let mut steps = 0;
+    'walk: while steps < 200 {
+        steps += 1;
+        while ex.dialog.is_some() {
+            let choices = ex.choices(&db);
+            assert!(!choices.is_empty(), "an open dialog offers choices");
+            match ex.choose(&db, &mut save, 0) {
+                Next::Battle { .. } => {
+                    fights += 1;
+                    ex.battle_won(&db, &mut save);
+                }
+                Next::Victory => break 'walk,
+                Next::Defeat => panic!("defeated"),
+                _ => {}
+            }
+        }
+        // Head for the nearest room with an unfinished event.
+        let target = (0..ex.tomb.rooms.len()).find(|&r| ex.tomb.rooms[r].event.is_some() && !ex.events[r].ended);
+        let Some(target) = target else { break };
+        let next = step_towards(&ex, target);
+        ex.move_to(&db, &save, next);
+    }
+    println!("tutorial: {fights} fights, awakening {}, blackstone +{}", ex.awake, ex.blackstone);
+    assert!(ex.objective_done(), "the tutorial's objective events all end");
+}
+
+fn step_towards(ex: &cogitator::rules::explore::Expedition, target: usize) -> usize {
+    use std::collections::VecDeque;
+    let mut prev = vec![usize::MAX; ex.tomb.rooms.len()];
+    let mut queue = VecDeque::from([ex.room]);
+    prev[ex.room] = ex.room;
+    while let Some(r) = queue.pop_front() {
+        if r == target {
+            break;
+        }
+        for n in ex.tomb.neighbours(r) {
+            if prev[n] == usize::MAX {
+                prev[n] = r;
+                queue.push_back(n);
+            }
+        }
+    }
+    let mut at = target;
+    while prev[at] != ex.room {
+        at = prev[at];
+    }
+    at
+}
+
+/// The tutorial team fights the first tutorial room: the player side attacks what it can reach and
+/// otherwise closes in; the Necrons run their own AI. Prints the team's skills and the result.
+#[test]
+fn tutorial_team_fights_the_first_tutorial_battle() {
+    use cogitator::rules::battle::{Battle, Kind, Side, SkillSpec, distance};
+    use cogitator::rules::save::{Save, Settings};
+    let Some(dir) = pack() else { return };
+    if !cogitator::rules::battle::room_exists(&dir, "Tuto_Battle_1") {
+        eprintln!("skipped: battle rooms not converted");
+        return;
+    }
+    let db = cogitator::data::Db::load(&dir).unwrap();
+    let mut save = Save::new_game(&db, Settings::default()).unwrap();
+    save.deploy_tutorial(&db).unwrap();
+    let team = save.deployment.as_ref().unwrap().units.clone();
+    let spawn = cogitator::rules::battle::SpawnContext { mission: save.deployment.as_ref().map(|d| d.mission), awake_level: 0, story_event: true };
+    let mut b = Battle::new(&db, &dir, "Tuto_Battle_1", None, &team, 3, 7, &save.settings, &spawn).unwrap();
+    for f in &b.fighters {
+        let skills: Vec<String> = f.skills.iter().filter_map(|s| db.get(s.skill)).map(|s| {
+            let spec = SkillSpec::read(s);
+            format!("{} (r{} d{:?} cp{})", spec.name, spec.range_max, spec.damage, spec.cost)
+        }).collect();
+        println!("{:?} {:?} {} hp{} init{} mv{} at {:?}: {skills:?}", f.side, f.kind, f.name, f.hp, f.initiative, f.move_range, f.cell);
+    }
+    assert!(b.fighters.iter().any(|f| f.side == Side::Necron && f.kind == Kind::Unit), "the room has Necrons");
+    assert!(b.fighters.iter().any(|f| f.side == Side::Mechanicus), "the team deployed");
+    let mut guard = 0;
+    while b.outcome.is_none() && guard < 2000 {
+        guard += 1;
+        let Some(who) = b.current() else { break };
+        if !b.is_player_turn() {
+            b.necron_act(&db);
+            continue;
+        }
+        let attack = |b: &Battle| (0..b.fighters[who].skills.len()).find_map(|s| {
+            if b.skill_blocked(&db, who, s).is_some() { return None; }
+            b.targets(&db, who, s).into_iter().find(|&t| b.fighters[t].side == Side::Necron).map(|t| (s, t))
+        });
+        if let Some((s, t)) = attack(&b) {
+            b.use_skill(&db, who, s, t);
+        } else if let Some(goal) = b.fighters.iter().filter(|f| f.side == Side::Necron && (f.alive() || f.knocked_out.is_some()) && f.kind == Kind::Unit).map(|f| f.cell).next() {
+            let me = b.fighters[who].cell;
+            let reach = b.reachable(who, b.fighters[who].moves_left());
+            if let Some((&cell, _)) = reach.iter().min_by(|x, y| distance(*x.0, goal).total_cmp(&distance(*y.0, goal))) && cell != me {
+                b.move_to(who, cell);
+            }
+            if let Some((s, t)) = attack(&b) {
+                b.use_skill(&db, who, s, t);
+            }
+        }
+        b.end_turn();
+    }
+    println!("outcome {:?} after {} rounds, cognition {}, {} events, AI gaps {:?}", b.outcome, b.round, b.cognition, b.events.len(), b.unported_ai);
+    let necron_moves = b.events.iter().filter(|e| matches!(e, cogitator::rules::battle::Event::Moved { who, .. } if b.fighters[*who].side == Side::Necron)).count();
+    let necron_hits = b.events.iter().filter(|e| matches!(e, cogitator::rules::battle::Event::Skill { who, .. } if b.fighters[*who].side == Side::Necron)).count();
+    println!("necron moves {necron_moves}, necron attacks {necron_hits}");
+    assert!(b.outcome.is_some(), "the battle ends");
+}
+
+/// A campaign fight: the first Agrolekh room filled from mission C1's random deployment.
+#[test]
+fn campaign_room_spawns_the_missions_necrons() {
+    use cogitator::rules::battle::{Battle, Kind, Side, SpawnContext};
+    use cogitator::rules::save::{Save, Settings};
+    let Some(dir) = pack() else { return };
+    if !cogitator::rules::battle::room_exists(&dir, "Agrolekh_B_01") {
+        return;
+    }
+    let db = cogitator::data::Db::load(&dir).unwrap();
+    let save = Save::new_game(&db, Settings::default()).unwrap();
+    let mission = db.named("Mission", "C1").map(|m| m.id);
+    let spawn = SpawnContext { mission, awake_level: 0, story_event: false };
+    let b = Battle::new(&db, &dir, "Agrolekh_B_01", None, &save.techpriests, 2, 11, &save.settings, &spawn).unwrap();
+    let necrons: Vec<String> = b.fighters.iter().filter(|f| f.side == Side::Necron && f.kind == Kind::Unit).map(|f| f.name.clone()).collect();
+    println!("Agrolekh_B_01 template {}: {necrons:?}", b.template);
+    assert!(!necrons.is_empty(), "the mission's deployment spawned Necrons");
+}

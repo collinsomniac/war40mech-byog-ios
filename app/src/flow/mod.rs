@@ -2,7 +2,13 @@
 //! ported logic. Every Unity persistent call is bound by `Class.Method` to an `Action`; a call with no
 //! binding is reported in-game as not yet ported and counted in `Parity`.
 
+pub mod ark;
+pub mod autoplay;
+pub mod battle;
+pub mod camera;
+pub mod campaign;
 pub mod exploration;
+pub mod hud;
 pub mod main_menu;
 pub mod scene3d;
 
@@ -42,6 +48,8 @@ pub enum Action {
     CloseWindow(&'static str),
     Goto(GameState),
     Rollover,
+    /// Load the saved campaign and resume where it was (MainMenu.OnClickBtnContinue).
+    Continue,
     Quit,
     /// Deliberately does nothing in the port (analytics, store links, console-only paths).
     Ignore,
@@ -97,17 +105,39 @@ pub struct FlowPlugin;
 
 impl Plugin for FlowPlugin {
     fn build(&self, app: &mut App) {
+        use GameState::*;
         app.init_state::<GameState>()
             .init_resource::<Parity>()
+            .init_resource::<campaign::Campaign>()
+            .init_resource::<camera::CameraDrag>()
+            .add_plugins(hud::HudPlugin)
             .add_systems(Startup, spawn_toast)
-            .add_systems(OnEnter(GameState::MainMenu), ((spawn_scene_ui, main_menu::prepare).chain(), scene3d::spawn))
-            .add_systems(OnEnter(GameState::Intro), exploration::skip_intro)
-            .add_systems(OnEnter(GameState::Exploration), ((spawn_scene_ui, exploration::prepare).chain(), scene3d::spawn))
-            .add_systems(OnEnter(GameState::Battle), unported_state)
-            .add_systems(OnEnter(GameState::Ark), unported_state)
-            .add_systems(Update, (run_calls, show_toast, scene3d::frame, scene3d::scale_lights));
-        for state in [GameState::MainMenu, GameState::Exploration] {
-            app.add_systems(OnExit(state), (despawn_scene_ui, scene3d::despawn));
+            .add_systems(OnEnter(MainMenu), ((spawn_scene_ui, main_menu::prepare).chain(), scene3d::spawn, scene3d::default_ambient))
+            .add_systems(OnEnter(Intro), exploration::skip_intro)
+            .add_systems(OnEnter(Exploration), ((spawn_scene_ui, exploration::prepare).chain(), scene3d::spawn, exploration::enter))
+            .add_systems(
+                Update,
+                (exploration::draw_map, camera::control, exploration::follow, exploration::click_rooms, exploration::act, exploration::draw_hud, exploration::fill_counters)
+                    .chain()
+                    .run_if(in_state(Exploration)),
+            )
+            .add_systems(OnExit(Exploration), exploration::exit)
+            .add_systems(OnEnter(Battle), battle::enter)
+            .add_systems(
+                Update,
+                (battle::spawn_room_scene, battle::filter_template, battle::sync_fighters, battle::hide_tokens, camera::control, battle::clicks, battle::act, battle::pace, battle::draw_overlays, battle::place_labels, battle::draw_hud)
+                    .chain()
+                    .run_if(in_state(Battle)),
+            )
+            .add_systems(OnExit(Battle), battle::exit)
+            .add_systems(OnEnter(Ark), (ark::enter, scene3d::spawn, scene3d::default_ambient))
+            .add_systems(Update, (ark::act, ark::draw).chain().run_if(in_state(Ark)))
+            .add_systems(OnExit(Ark), ark::exit)
+            .add_systems(Update, log_state.run_if(state_changed::<GameState>))
+            .add_systems(Update, (run_calls, show_toast, scene3d::frame, scene3d::scale_lights, scene3d::effect_materials, scene3d::fade_walls, scene3d::carry_table, battle::animate_units))
+            .add_systems(Update, autoplay::autoplay.before(exploration::act).before(battle::act).before(ark::act).run_if(|| autoplay::enabled()));
+        for state in [MainMenu, Exploration, Battle, Ark] {
+            app.add_systems(OnExit(state), (despawn_scene_ui, scene3d::despawn, hud::despawn_hud));
         }
     }
 }
@@ -136,17 +166,14 @@ fn despawn_scene_ui(mut commands: Commands, roots: Query<Entity, With<UnityUiRoo
     }
 }
 
-/// A state whose scene isn't ported yet still loads, says so, and offers the way back.
-fn unported_state(state: Res<State<GameState>>, mut parity: ResMut<Parity>) {
-    parity.report(&format!("Scene {:?}", state.get()));
-}
-
 fn run_calls(
     mut calls: MessageReader<UnityCall>,
     mut nodes: Query<(&UnityNode, &mut UnityActive)>,
     mut next: ResMut<NextState<GameState>>,
     mut parity: ResMut<Parity>,
     mut exit: MessageWriter<AppExit>,
+    mut campaign: ResMut<campaign::Campaign>,
+    pack: Res<crate::PackDir>,
 ) {
     for call in calls.read() {
         let e = &call.event;
@@ -157,6 +184,14 @@ fn run_calls(
             Action::Quit => {
                 exit.write(AppExit::Success);
             }
+            Action::Continue => match campaign::Campaign::load(&pack.0) {
+                Some(loaded) => {
+                    let state = if loaded.expedition.is_some() { GameState::Exploration } else { GameState::Ark };
+                    *campaign = loaded;
+                    next.set(state);
+                }
+                None => parity.report("Continue: the save could not be read"),
+            },
             Action::Rollover | Action::Ignore => {}
             Action::Unported(name) => parity.report(&name),
         }
@@ -179,6 +214,10 @@ fn set_window(nodes: &mut Query<(&UnityNode, &mut UnityActive)>, class: &str, op
             active.0 = any_open;
         }
     }
+}
+
+fn log_state(state: Res<State<GameState>>) {
+    info!("state: {:?}", state.get());
 }
 
 fn spawn_toast(mut commands: Commands) {

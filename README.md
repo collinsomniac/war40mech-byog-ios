@@ -12,29 +12,32 @@ your Steam install ──► converter (PC) ──► content/pack ──► ser
 
 ## Status
 
-Early bring-up. Working today:
-
-- `converter/inventory.py`: scans every serialized file in the install (395k GameObjects, 1,040 script classes).
-- `converter/odin.py`: a reader for the Odin Serializer binary format (OdinSerializer is Apache-2.0), used by
-  the game's rules data. Decodes 1,701 of 1,701 blobs in the main data files.
-- `converter/export_data.py`: exports skills, equipment, Tech-Priests, dungeon events, rooms, blueprints and
-  dialogue to JSON.
-- `app/`: syncs the pack over Tailscale (manifest + SHA-256, incremental) and reports what arrived.
+Playable loop: main menu → New Game → the tutorial tomb (generated, events, rewards, awakening) → battles
+(the game's grids, spawns, movement, skills and Necron behaviour trees) → the Ark (missions on offer,
+armoury, deployment) → the next tomb. See [docs/STATUS.md](docs/STATUS.md) for what is faithful,
+approximate or still a placeholder, and [docs/METHOD.md](docs/METHOD.md) for how the port is built.
 
 ## Use
 
-On the PC (Python 3.12, run once per game update):
+On the PC (Python 3.12, run once per game update; `<Data>` is `<Steam>\steamapps\common\Mechanicus\Mechanicus_Data`):
 
 ```
 cd converter
-python -m venv .venv && .venv\Scripts\pip install UnityPy TypeTreeGeneratorAPI
-.venv\Scripts\python export_data.py "<Steam>\steamapps\common\Mechanicus\Mechanicus_Data" --pack ..\content\pack
+python -m venv .venv && .venv\Scripts\pip install UnityPy TypeTreeGeneratorAPI numpy dnfile pillow
+.venv\Scripts\python export_data.py <Data> --pack ..\content\pack --scenes     # every data record
+.venv\Scripts\python export_enums.py <Data> --pack ..\content\pack             # enum tables from the DLL
+.venv\Scripts\python export_ui.py <Data> --pack ..\content\pack --loc --fonts --scene level5=MainMenu --scene level11=DungeonUI
+.venv\Scripts\python export_prefab.py <Data> --pack ..\content\pack --scene level5=MainMenuScene --scene level1=ExplorationScene
+.venv\Scripts\python export_camera.py <Data> --pack ..\content\pack --scene level1=Exploration
+.venv\Scripts\python export_battle.py <Data> --pack ..\content\pack                # every battle room
+.venv\Scripts\python export_units.py <Data> --pack ..\content\pack                 # unit models
+.venv\Scripts\python fit_textures.py ..\content\pack\models	extures --max 1024   # mobile texture budget
 .venv\Scripts\python build_manifest.py ..\content\pack
 python ..\server\serve.py --pack ..\content\pack --bind <this PC's Tailscale IP> --port 8790
 ```
 
-The phone build comes from the `build-ipa` workflow as an unsigned IPA. Sign it with a free Apple ID (keep the
-`increased-memory-limit` entitlement) and install it. Set the repository variable `COGITATOR_SERVER` to your
+The phone build comes from the `build-ipa` workflow as an unsigned IPA. Sign and install it wirelessly with
+[appman](https://github.com/collinsomniac/appman-ios). Set the repository variable `COGITATOR_SERVER` to your
 pack server's URL, e.g. `http://<pc-name>:8790` using Tailscale MagicDNS.
 
 ## Rules for contributors

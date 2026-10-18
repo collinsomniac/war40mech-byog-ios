@@ -46,15 +46,18 @@ class Gltf:
         return len(self.doc["bufferViews"]) - 1
 
     def accessor(self, rows: list, kind: str, minmax: bool = False, indices: bool = False,
-                 animation: bool = False) -> int:
-        """Vertex data by default; `indices` for triangle lists; `animation` for sampler input/output."""
-        width = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}[kind]
+                 animation: bool = False, joints: bool = False) -> int:
+        """Vertex data by default; `indices` for triangle lists; `animation` for sampler input/output;
+        `joints` for JOINTS_0 (unsigned shorts)."""
+        width = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT4": 16}[kind]
         flat = [c for row in rows for c in (row if width > 1 else (row,))]
-        if indices:
+        if joints:
+            data, ctype, target = struct.pack(f"<{len(flat)}H", *flat), 5123, ARRAY_BUFFER
+        elif indices:
             data, ctype, target = struct.pack(f"<{len(flat)}I", *flat), UINT32, ELEMENT_ARRAY_BUFFER
         else:
             data, ctype = struct.pack(f"<{len(flat)}f", *flat), FLOAT
-            target = None if animation else ARRAY_BUFFER
+            target = None if animation or kind == "MAT4" else ARRAY_BUFFER
         if width == 1:
             rows = [(r,) for r in rows]
         acc = {"bufferView": self._view(data, target), "componentType": ctype, "count": len(rows), "type": kind}
@@ -72,6 +75,14 @@ class Gltf:
         return self.image_index[uri]
 
     def write(self, path: pathlib.Path) -> None:
+        self.doc["scenes"][0]["nodes"].extend(self.__dict__.pop("world_nodes", []))
+        # Texture URIs are relative to models/; models in subfolders (units/, battle/) step back up.
+        models = next((p for p in path.parents if p.name == "models"), path.parent)
+        depth = len(path.parent.relative_to(models).parts) if path.parent != models else 0
+        if depth:
+            for image in self.doc["images"]:
+                if image["uri"].startswith("textures/"):
+                    image["uri"] = "../" * depth + image["uri"]
         self.doc["buffers"] = [{"byteLength": len(self.blob)}]
         doc = {k: v for k, v in self.doc.items() if v != []}
         body = json.dumps(doc, separators=(",", ":")).encode()
@@ -91,40 +102,60 @@ class Exporter:
         self.textures_dir.mkdir(parents=True, exist_ok=True)
         self.models_dir.mkdir(parents=True, exist_ok=True)
         self.written_textures: set[str] = set()
+        # Optional (gameobject path_id, batched) -> extras dict, for callers that tag nodes (battle templates).
+        self.node_extras = None
+        # Leave out inactive GameObjects (variant parts a prefab toggles on at runtime).
+        self.skip_inactive = False
+        # Optional clip-name predicate: which Animator clips to export.
+        self.clip_filter = None
 
     # --- textures -------------------------------------------------------------------------------------------
 
+    def _have(self, filename: str) -> bool:
+        """Textures persist across runs and models; convert each once."""
+        if filename in self.written_textures or (self.textures_dir / filename).exists():
+            self.written_textures.add(filename)
+            return True
+        return False
+
     def _save(self, name: str, image: Image.Image) -> str:
         filename = f"{name}.png"
-        if filename not in self.written_textures:
+        if not self._have(filename):
             image.save(self.textures_dir / filename, optimize=False)
             self.written_textures.add(filename)
         return f"textures/{filename}"
 
     def albedo(self, tex) -> str:
+        if self._have(f"{tex.m_Name}.png"):
+            return f"textures/{tex.m_Name}.png"
         return self._save(tex.m_Name, tex.image.convert("RGBA"))
 
     def normal(self, tex) -> str:
-        image = tex.image.convert("RGBA")
-        r, g, b, a = image.split()
+        if self._have(f"{tex.m_Name}.normal.png"):
+            return f"textures/{tex.m_Name}.normal.png"
+        import numpy as np
+        px = np.asarray(tex.image.convert("RGBA"), dtype=np.float32)
+        r, g, a = px[..., 0], px[..., 1], px[..., 3]
         # DXT5nm stores X in alpha with red saturated; rebuild a standard tangent-space normal map.
-        if ImageStat.Stat(r.resize((32, 32))).mean[0] > 250 and ImageStat.Stat(a.resize((32, 32))).stddev[0] > 1:
-            x, y = a, g
-            z = Image.new("L", image.size)
-            z.putdata([round((max(0.0, 1 - (xv / 127.5 - 1) ** 2 - (yv / 127.5 - 1) ** 2) ** 0.5 + 1) * 127.5)
-                       for xv, yv in zip(x.getdata(), y.getdata())])
-            image = Image.merge("RGB", (x, y, z))
+        if r.mean() > 250 and a.std() > 1:
+            x, y = a / 127.5 - 1, g / 127.5 - 1
+            z = np.sqrt(np.clip(1 - x * x - y * y, 0, 1))
+            out = np.stack([a, g, (z + 1) * 127.5], axis=-1)
         else:
-            image = Image.merge("RGB", (r, g, b))
+            out = px[..., :3]
+        image = Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "RGB")
         return self._save(f"{tex.m_Name}.normal", image)
 
     def packed_orm(self, tex) -> tuple[str, str]:
         """Mechanicus packs metallic (R), AO (G), emission mask (B), smoothness (A).
         glTF wants occlusion (R), roughness (G), metallic (B). Emission mask is kept as its own texture."""
+        orm_name, mask_name = f"{tex.m_Name}.orm", f"{tex.m_Name}.emission"
+        if self._have(orm_name + ".png") and self._have(mask_name + ".png"):
+            return f"textures/{orm_name}.png", f"textures/{mask_name}.png"
         metal, ao, emission, smooth = tex.image.convert("RGBA").split()
         rough = Image.eval(smooth, lambda v: 255 - v)
-        orm = self._save(f"{tex.m_Name}.orm", Image.merge("RGB", (ao, rough, metal)))
-        mask = self._save(f"{tex.m_Name}.emission", Image.merge("RGB", (emission, emission, emission)))
+        orm = self._save(orm_name, Image.merge("RGB", (ao, rough, metal)))
+        mask = self._save(mask_name, Image.merge("RGB", (emission, emission, emission)))
         return orm, mask
 
     # --- materials ------------------------------------------------------------------------------------------
@@ -132,12 +163,15 @@ class Exporter:
     def material(self, gltf: Gltf, mat_ptr) -> int:
         if mat_ptr.path_id in gltf.material_index:
             return gltf.material_index[mat_ptr.path_id]
-        mat = mat_ptr.read()
-        shader = mat.m_Shader.read()
-        shader_name = shader.m_ParsedForm.m_Name if hasattr(shader, "m_ParsedForm") else shader.m_Name
-        texs = {k: v.m_Texture for k, v in mat.m_SavedProperties.m_TexEnvs if v.m_Texture.path_id}
-        colors = {k: v for k, v in mat.m_SavedProperties.m_Colors}
-        floats = {k: v for k, v in mat.m_SavedProperties.m_Floats}
+        cache = self.__dict__.setdefault("parsed_materials", {})
+        key = (getattr(mat_ptr, "assets_file", None) and mat_ptr.assets_file.name, mat_ptr.file_id, mat_ptr.path_id)
+        if key not in cache:
+            mat = mat_ptr.read()
+            shader = mat.m_Shader.read()
+            shader_name = shader.m_ParsedForm.m_Name if hasattr(shader, "m_ParsedForm") else shader.m_Name
+            cache[key] = (mat, shader_name, {k: v.m_Texture for k, v in mat.m_SavedProperties.m_TexEnvs if v.m_Texture.path_id},
+                          {k: v for k, v in mat.m_SavedProperties.m_Colors}, {k: v for k, v in mat.m_SavedProperties.m_Floats})
+        mat, shader_name, texs, colors, floats = cache[key]
 
         pbr = {"metallicFactor": 1.0, "roughnessFactor": 1.0}
         entry = {"name": mat.m_Name, "pbrMetallicRoughness": pbr,
@@ -163,49 +197,113 @@ class Exporter:
 
     # --- meshes and hierarchy -------------------------------------------------------------------------------
 
-    def mesh(self, gltf: Gltf, mesh, materials: list) -> int | None:
-        handler = MeshHandler(mesh)
-        handler.process()
+    def mesh(self, gltf: Gltf, mesh, materials: list, first: int = 0, count: int | None = None,
+             skinned: bool = False) -> int | None:
+        """A glTF mesh for `mesh` (or just submeshes first..first+count of it, for statically batched
+        renderers), cached so instances share one copy."""
+        reader = getattr(mesh, "object_reader", None)
+        key = (getattr(reader, "path_id", id(mesh)), tuple(m.path_id for m in materials), first, count, skinned)
+        cache = gltf.__dict__.setdefault("mesh_index", {})
+        if key in cache:
+            return cache[key]
+        cache[key] = self._mesh(gltf, mesh, materials, first, count, skinned)
+        return cache[key]
+
+    def _mesh(self, gltf: Gltf, mesh, materials: list, first: int, count: int | None, skinned: bool = False) -> int | None:
+        handlers = gltf.__dict__.setdefault("handlers", {})
+        reader = getattr(mesh, "object_reader", None)
+        key = getattr(reader, "path_id", id(mesh))
+        if key not in handlers:
+            handler = MeshHandler(mesh)
+            handler.process()
+            handlers[key] = (handler, handler.get_triangles())
+        handler, all_triangles = handlers[key]
         if not handler.m_Vertices:
             return None
-        positions = [(-x, y, z) for x, y, z, *_ in handler.m_Vertices]
-        attributes = {"POSITION": gltf.accessor(positions, "VEC3", minmax=True)}
-        if handler.m_Normals:
-            attributes["NORMAL"] = gltf.accessor([(-x, y, z) for x, y, z, *_ in handler.m_Normals], "VEC3")
-        if handler.m_Tangents:
-            attributes["TANGENT"] = gltf.accessor([(-x, y, z, -w) for x, y, z, w in handler.m_Tangents], "VEC4")
-        if handler.m_UV0:
-            attributes["TEXCOORD_0"] = gltf.accessor([(u, 1 - v) for u, v, *_ in handler.m_UV0], "VEC2")
         primitives = []
-        for i, triangles in enumerate(handler.get_triangles()):
+        for i, triangles in enumerate(all_triangles):
+            if count is not None and not first <= i < first + count:
+                continue
             if not triangles:
                 continue
-            indices = [index for a, b, c in triangles for index in (a, c, b)]
+            # Only the vertices this submesh uses (combined static-batch meshes hold a whole scene).
+            used = sorted({index for tri in triangles for index in tri})
+            remap = {old: new for new, old in enumerate(used)}
+            pick = lambda rows: [rows[k] for k in used]  # noqa: E731
+            attributes = {"POSITION": gltf.accessor([(-x, y, z) for x, y, z, *_ in pick(handler.m_Vertices)], "VEC3", minmax=True)}
+            if handler.m_Normals:
+                attributes["NORMAL"] = gltf.accessor([(-x, y, z) for x, y, z, *_ in pick(handler.m_Normals)], "VEC3")
+            if handler.m_Tangents:
+                attributes["TANGENT"] = gltf.accessor([(-x, y, z, -w) for x, y, z, w in pick(handler.m_Tangents)], "VEC4")
+            if handler.m_UV0:
+                attributes["TEXCOORD_0"] = gltf.accessor([(u, 1 - v) for u, v, *_ in pick(handler.m_UV0)], "VEC2")
+            if skinned and handler.m_BoneIndices and handler.m_BoneWeights:
+                attributes["JOINTS_0"] = gltf.accessor([tuple(int(j) for j in (list(b) + [0, 0, 0, 0])[:4]) for b in pick(handler.m_BoneIndices)], "VEC4", joints=True)
+                weights = []
+                for w in pick(handler.m_BoneWeights):
+                    w = (list(w) + [0.0, 0.0, 0.0, 0.0])[:4]
+                    total = sum(w) or 1.0
+                    weights.append(tuple(x / total for x in w))
+                attributes["WEIGHTS_0"] = gltf.accessor(weights, "VEC4")
+            indices = [remap[index] for a, b, c in triangles for index in (a, c, b)]
             prim = {"attributes": attributes, "indices": gltf.accessor(indices, "SCALAR", indices=True)}
-            if i < len(materials):
-                prim["material"] = self.material(gltf, materials[i])
+            slot = i - first if count is not None else i
+            if slot < len(materials):
+                prim["material"] = self.material(gltf, materials[slot])
             primitives.append(prim)
+        if not primitives:
+            return None
         gltf.doc["meshes"].append({"name": mesh.m_Name, "primitives": primitives})
         return len(gltf.doc["meshes"]) - 1
 
     def node(self, gltf: Gltf, transform, stats: dict) -> int:
         go = transform.m_GameObject.read()
+        if self.skip_inactive and not go.m_IsActive:
+            gltf.doc["nodes"].append({"name": go.m_Name + " (inactive)"})
+            return len(gltf.doc["nodes"]) - 1
         p, q, s = transform.m_LocalPosition, transform.m_LocalRotation, transform.m_LocalScale
         node = {"name": go.m_Name, "translation": [-p.x, p.y, p.z], "rotation": [q.x, -q.y, -q.z, q.w],
                 "scale": [s.x, s.y, s.z]}
         if not go.m_IsActive:
             node["extras"] = {"inactive": True}
+        if self.node_extras and (extra := self.node_extras(transform.m_GameObject.path_id, batched=False)):
+            node.setdefault("extras", {}).update(extra)
         components = {c.component.type.name: c.component for c in go.m_Component}
         if "MeshRenderer" in components and "MeshFilter" in components:
             renderer = components["MeshRenderer"].read()
             mesh_ptr = components["MeshFilter"].read().m_Mesh
-            if mesh_ptr.path_id:
-                index = self.mesh(gltf, mesh_ptr.read(), list(renderer.m_Materials))
+            batch = getattr(renderer, "m_StaticBatchInfo", None)
+            batched = batch is not None and batch.subMeshCount > 0
+            if mesh_ptr.path_id and renderer.m_Enabled:
+                mesh = mesh_ptr.read()
+                if batched:
+                    # Static batching: the combined mesh is already in world space; draw this renderer's
+                    # submesh range from a root-level node with no transform.
+                    index = self.mesh(gltf, mesh, list(renderer.m_Materials), batch.firstSubMesh, batch.subMeshCount)
+                    if index is not None and go.m_IsActive:
+                        world = {"name": go.m_Name + " (batched)", "mesh": index}
+                        if self.node_extras and (extra := self.node_extras(transform.m_GameObject.path_id, batched=True)):
+                            world["extras"] = extra
+                        gltf.doc["nodes"].append(world)
+                        gltf.__dict__.setdefault("world_nodes", []).append(len(gltf.doc["nodes"]) - 1)
+                        stats["meshes"] += 1
+                else:
+                    index = self.mesh(gltf, mesh, list(renderer.m_Materials))
+                    if index is not None:
+                        node["mesh"] = index
+                        stats["meshes"] += 1
+        if "SkinnedMeshRenderer" in components:
+            skin = components["SkinnedMeshRenderer"].read()
+            if skin.m_Mesh.path_id and skin.m_Enabled:
+                smesh = skin.m_Mesh.read()
+                index = self.mesh(gltf, smesh, list(skin.m_Materials), skinned=True)
                 if index is not None:
                     node["mesh"] = index
-                    stats["meshes"] += 1
-        if "SkinnedMeshRenderer" in components:
-            stats["skipped_skinned"] += 1
+                    stats["skinned"] = stats.get("skinned", 0) + 1
+                    gltf.__dict__.setdefault("pending_skins", []).append(
+                        (None, [b.path_id for b in skin.m_Bones], list(smesh.m_BindPose)))
+            else:
+                stats["skipped_skinned"] += 1
         if "Camera" in components:
             cam = components["Camera"].read_typetree()
             if cam.get("m_Enabled"):
@@ -222,6 +320,12 @@ class Exporter:
                 stats["lights"] = stats.get("lights", 0) + 1
         gltf.doc["nodes"].append(node)
         index = len(gltf.doc["nodes"]) - 1
+        reader = getattr(transform, "object_reader", None)
+        if reader is not None:
+            gltf.__dict__.setdefault("node_of_transform", {})[reader.path_id] = index
+        pending = gltf.__dict__.get("pending_skins")
+        if pending and pending[-1][0] is None and "mesh" in node and "SkinnedMeshRenderer" in components:
+            pending[-1] = (index, pending[-1][1], pending[-1][2])
         if "Animator" in components:
             self.animators.append((index, components["Animator"].read()))
         children = [self.node(gltf, child.read(), stats) for child in transform.m_Children]
@@ -273,8 +377,29 @@ class Exporter:
         stats["bytes"] = out.stat().st_size
         return stats
 
+    def skins(self, gltf: Gltf, stats: dict) -> None:
+        """glTF skins for skinned renderers, once every bone's node exists. Bind poses are mirrored in X
+        like everything else (S M S with S = diag(-1, 1, 1, 1)) and stored column-major."""
+        nodes = gltf.__dict__.get("node_of_transform", {})
+        for node_index, bones, bindposes in gltf.__dict__.pop("pending_skins", []):
+            if node_index is None:
+                continue
+            joints = [nodes.get(b) for b in bones]
+            if not joints or any(j is None for j in joints) or len(bindposes) < len(joints):
+                gltf.doc["nodes"][node_index].pop("mesh", None)
+                stats["skins_unresolved"] = stats.get("skins_unresolved", 0) + 1
+                continue
+            mats = []
+            sign = (-1.0, 1.0, 1.0, 1.0)
+            for m in bindposes[:len(joints)]:
+                e = [[getattr(m, f"e{r}{c}") for c in range(4)] for r in range(4)]
+                mats.append(tuple(sign[r] * e[r][c] * sign[c] for c in range(4) for r in range(4)))
+            gltf.doc.setdefault("skins", []).append({"joints": joints, "inverseBindMatrices": gltf.accessor(mats, "MAT4")})
+            gltf.doc["nodes"][node_index]["skin"] = len(gltf.doc["skins"]) - 1
+
     def animations(self, gltf: Gltf, stats: dict) -> None:
         """Every clip of every Animator's controller becomes a glTF animation targeting the exported nodes."""
+        self.skins(gltf, stats)
         for animator_node, animator in self.animators:
             if not animator.m_Avatar.path_id or not animator.m_Controller.path_id:
                 continue
@@ -288,12 +413,15 @@ class Exporter:
                     walk(child, f"{path}/{name}" if path else name)
 
             walk(animator_node, "")
-            seen = set()
+            seen, seen_names = set(), set()
             for clip_ptr in animator.m_Controller.read().m_AnimationClips:
                 if clip_ptr.path_id in seen:
                     continue
                 seen.add(clip_ptr.path_id)
                 clip = clip_ptr.read()
+                if clip.m_Name in seen_names or (self.clip_filter and not self.clip_filter(clip.m_Name)):
+                    continue
+                seen_names.add(clip.m_Name)
                 channels, samplers = [], []
                 for path, prop, times, values in anim.sample_clip(clip, path_of_hash):
                     if path not in node_of_path:

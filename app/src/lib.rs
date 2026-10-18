@@ -3,11 +3,13 @@
 //! This app ships no game content. On launch it syncs a content pack converted from the player's own
 //! installation and served from their PC over Tailscale, then runs the game from it.
 
+pub mod data;
 pub mod flow;
 #[cfg(target_os = "ios")]
 pub mod ios_scene;
 pub mod loc;
 pub mod pack;
+pub mod rules;
 pub mod unity_ui;
 
 use bevy::asset::io::AssetSourceBuilder;
@@ -69,7 +71,7 @@ impl Plugin for GamePlugin {
         app.insert_resource(PackDir(self.pack.clone()))
             .insert_resource(status)
             .insert_resource(SyncWanted(self.sync))
-            .add_plugins((unity_ui::UnityUiPlugin, flow::FlowPlugin))
+            .add_plugins((unity_ui::UnityUiPlugin, flow::FlowPlugin, bevy::picking::mesh_picking::MeshPickingPlugin))
             .add_systems(Startup, (setup, start_sync))
             .add_systems(Update, (show_status, finish_boot).run_if(in_state(GameState::Boot)))
             .add_systems(OnExit(GameState::Boot), hide_status);
@@ -159,12 +161,19 @@ fn snapshot(
 pub struct MainCamera;
 
 fn setup(mut commands: Commands) {
-    commands.spawn((
-        Camera3d::default(),
-        Camera { clear_color: ClearColorConfig::Custom(Color::srgb(0.01, 0.012, 0.02)), ..default() },
-        Projection::Perspective(PerspectiveProjection { fov: 30f32.to_radians(), near: 0.3, far: 200_000.0, ..default() }),
-        MainCamera,
-    ));
+    let camera = commands
+        .spawn((
+            Camera3d::default(),
+            Camera { clear_color: ClearColorConfig::Custom(Color::srgb(0.01, 0.012, 0.02)), ..default() },
+            Projection::Perspective(PerspectiveProjection { fov: 30f32.to_radians(), near: 0.3, far: 200_000.0, ..default() }),
+            MainCamera,
+        ))
+        .id();
+    // The game's post-processing (ACES tonemapping, bloom on emissive glows): opt-in while it's verified on
+    // device; it stalled the desktop GPU once alongside emissive textures.
+    if std::env::var_os("COGITATOR_POST").is_some() {
+        commands.entity(camera).insert((bevy::core_pipeline::tonemapping::Tonemapping::AcesFitted, bevy::post_process::bloom::Bloom::NATURAL));
+    }
     commands.insert_resource(GlobalAmbientLight { color: Color::srgb(0.55, 0.6, 0.7), brightness: 120.0, ..default() });
     commands.spawn((
         Text::new("Cogitator"),
@@ -225,13 +234,29 @@ fn finish_boot(
         }
     }
     commands.insert_resource(unity_ui::Fonts::load(&pack.0, &assets));
-    // Development: COGITATOR_START=Exploration (etc.) opens that state directly.
+    let db = match data::Db::load(&pack.0) {
+        Ok(db) => db,
+        Err(e) => {
+            status.set(format!("Content pack incomplete: {e}"));
+            return;
+        }
+    };
+    info!("game data: {} records", db.len());
+    // Development: COGITATOR_START=Exploration|Ark starts a fresh campaign there (Intro = New Game).
     let start = match std::env::var("COGITATOR_START").as_deref() {
-        Ok("Exploration") => GameState::Exploration,
-        Ok("Battle") => GameState::Battle,
-        Ok("Ark") => GameState::Ark,
+        Ok("Exploration") => GameState::Intro,
+        Ok("Ark") => {
+            let mut campaign = flow::campaign::Campaign::default();
+            if let Ok(mut save) = rules::save::Save::new_game(&db, rules::save::Settings { skip_tutorial: true, ..default() }) {
+                save.story.tutorial_done = true;
+                campaign.save = Some(save);
+            }
+            commands.insert_resource(campaign);
+            GameState::Ark
+        }
         _ => GameState::MainMenu,
     };
+    commands.insert_resource(flow::campaign::GameDb(std::sync::Arc::new(db)));
     next.set(start);
 }
 

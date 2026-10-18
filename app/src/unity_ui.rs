@@ -206,7 +206,7 @@ impl Fonts {
         Fonts(map.into_iter().map(|(name, file)| (name, assets.load(format!("pack://{file}")))).collect())
     }
 
-    fn get(&self, name: &str) -> Handle<Font> {
+    pub fn get(&self, name: &str) -> Handle<Font> {
         self.0.get(name).or_else(|| self.0.get("")).cloned().unwrap_or_default()
     }
 }
