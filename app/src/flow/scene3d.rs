@@ -222,6 +222,15 @@ pub fn effect_materials(
         if shader.contains("Opti Fade") {
             commands.entity(entity).insert(FadeWall);
         }
+        // Unity's texture tiling (exported as extras.tiling = [scale x, scale y, offset x, offset y]); glTF's
+        // flipped v puts the offset at 1 - scale - offset.
+        if let Some(t) = v.get("tiling").and_then(|t| t.as_array())
+            && t.len() == 4
+            && let Some(mut m) = materials.get_mut(&material.0)
+        {
+            let f: Vec<f32> = t.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect();
+            m.uv_transform = bevy::math::Affine2::from_scale_angle_translation(Vec2::new(f[0], f[1]), 0.0, Vec2::new(f[2], 1.0 - f[1] - f[3]));
+        }
         let holo = shader.contains("Grid Explo") || shader.contains("Props/Ark Mechanicus") || shader.contains("Nebulae") || shader.contains("Table Light");
         if holo {
             // The tomb table's holograms: grid, layered holo planes, nebula floor, table light.

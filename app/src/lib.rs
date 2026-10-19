@@ -47,6 +47,9 @@ impl Status {
 #[derive(Component)]
 struct StatusText;
 
+#[derive(Component)]
+struct StatusLine;
+
 /// The pack folder, plus whether to sync it: `COGITATOR_PACK` points desktop runs and tests at a local
 /// converted pack and skips the network.
 pub fn pack_location() -> (PathBuf, bool) {
@@ -175,11 +178,28 @@ fn setup(mut commands: Commands) {
         commands.entity(camera).insert((bevy::core_pipeline::tonemapping::Tonemapping::AcesFitted, bevy::post_process::bloom::Bloom::NATURAL));
     }
     commands.insert_resource(GlobalAmbientLight { color: Color::srgb(0.55, 0.6, 0.7), brightness: 120.0, ..default() });
+    // Boot status, centred and sized for the reference canvas (UiScale shrinks it with the screen), so sync
+    // progress and errors are always readable.
     commands.spawn((
-        Text::new("Cogitator"),
-        TextFont::from_font_size(22.0),
-        Node { margin: UiRect::all(Val::Px(48.0)), ..default() },
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.0),
+            right: Val::Px(0.0),
+            top: Val::Px(0.0),
+            bottom: Val::Px(0.0),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            padding: UiRect::all(Val::Px(120.0)),
+            ..default()
+        },
         StatusText,
+        children![(
+            Text::new("Cogitator"),
+            TextFont::from_font_size(54.0),
+            TextColor(Color::srgb(0.6, 1.0, 0.5)),
+            TextLayout::new(Justify::Center, LineBreak::WordBoundary),
+            StatusLine,
+        )],
     ));
 }
 
@@ -202,7 +222,7 @@ fn start_sync(status: Res<Status>, wanted: Res<SyncWanted>, pack: Res<PackDir>) 
     });
 }
 
-fn show_status(status: Res<Status>, mut texts: Query<&mut Text, With<StatusText>>) {
+fn show_status(status: Res<Status>, mut texts: Query<&mut Text, With<StatusLine>>) {
     let current = status.text.lock().unwrap().clone();
     for mut text in &mut texts {
         if text.0 != current {

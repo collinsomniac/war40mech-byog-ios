@@ -177,6 +177,13 @@ class Exporter:
         entry = {"name": mat.m_Name, "pbrMetallicRoughness": pbr,
                  "extras": {"unity_shader": shader_name, "floats": floats,
                             "colors": {k: [c.r, c.g, c.b, c.a] for k, c in colors.items()}}}
+        # Unity texture tiling/offset (m_Scale, m_Offset) of the main texture, applied by the app as a UV transform.
+        envs = {k: v for k, v in mat.m_SavedProperties.m_TexEnvs}
+        main_env = envs.get("_Albedo") or envs.get("_MainTex")
+        if main_env is not None and main_env.m_Texture.path_id:
+            sc, of = main_env.m_Scale, main_env.m_Offset
+            if (sc.x, sc.y, of.x, of.y) != (1.0, 1.0, 0.0, 0.0):
+                entry["extras"]["tiling"] = [sc.x, sc.y, of.x, of.y]
         if albedo := texs.get("_Albedo") or texs.get("_MainTex"):
             pbr["baseColorTexture"] = {"index": gltf.texture(self.albedo(albedo.read()))}
         if normal := texs.get("_Normal") or texs.get("_BumpMap"):

@@ -28,6 +28,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Files the game can't start without; a failure here stops the sync.
+const CORE: &[&str] = &["data/", "loc/", "fonts/", "ui/"];
+
 /// Pack folders fetched when first needed rather than at launch (each battle room is tens of MB and a
 /// campaign visits a few at a time).
 pub const ON_DEMAND: &[&str] = &["models/battle/"];
@@ -117,6 +120,7 @@ pub fn sync(server: &str, dir: &Path, report: &dyn Fn(String)) -> Result<Manifes
     let stale: Vec<&ManifestFile> = manifest.files.iter().filter(|f| !on_demand(&f.path) && !up_to_date(dir, &mut index, f)).collect();
     save_index(dir, &index);
     let total: u64 = stale.iter().map(|f| f.size).sum();
+    let mut failed: Vec<String> = Vec::new();
     let mut done = 0u64;
     for (i, file) in stale.iter().enumerate() {
         report(format!(
@@ -127,14 +131,25 @@ pub fn sync(server: &str, dir: &Path, report: &dyn Fn(String)) -> Result<Manifes
             done as f64 / 1e6,
             total as f64 / 1e6
         ));
-        download(server, dir, file)?;
-        index.insert(file.path.clone(), file.sha256.clone());
+        // One bad file shouldn't strand the player: note it and carry on; only core files are fatal.
+        match download(server, dir, file) {
+            Ok(()) => {
+                index.insert(file.path.clone(), file.sha256.clone());
+            }
+            Err(e) => failed.push(e),
+        }
         if i % 20 == 0 {
             save_index(dir, &index);
         }
         done += file.size;
     }
     save_index(dir, &index);
+    if let Some(core) = failed.iter().find(|e| CORE.iter().any(|c| e.starts_with(c) || e.contains(&format!("/{c}")))) {
+        return Err(format!("{} file(s) failed, including {core}", failed.len()));
+    }
+    if !failed.is_empty() {
+        report(format!("{} file(s) couldn't be downloaded (first: {}); continuing.", failed.len(), failed[0]));
+    }
     // Kept locally so a later launch without the PC can still play from this pack.
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     fs::write(dir.join("manifest.json"), &manifest_bytes).map_err(|e| e.to_string())?;
